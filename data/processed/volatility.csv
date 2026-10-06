@@ -1,0 +1,2 @@
+sigma_eth,sigma_eth_annualized,periods_per_year,ddof,n_obs,first_return_date,last_return_date,method
+0.23187474369552616,0.803237674145325,12,1,80,2020-02-29,2026-09-30,"std of monthly log returns, full sample"

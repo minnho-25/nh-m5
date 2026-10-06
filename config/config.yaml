@@ -1,0 +1,64 @@
+# HuiChain config: baseline values only.
+# KHÔNG phải giá trị optimal, không phải quy định pháp lý, không phải kết quả thực nghiệm.
+# Đơn vị tiền tệ: USD. Giá ETH: ETH/USD.
+
+pool: # MODEL / RESEARCH
+  N: 5
+  contribution_usd: 1000 # C, USD/member/round
+  cycle_months: 1
+  cycle_days: 30 # MODEL ASSUMPTION: one contribution/auction cycle
+
+market: # REAL DATA
+  source: yahoo_finance
+  ticker: ETH-USD
+  start_date: "2020-01-01"
+  end_date: null # null = ngày chạy script
+  frequency: 1d
+  price_column: close
+  monthly_price_method: last_close
+
+agent_endowment: # MODEL ASSUMPTION (không phải dữ liệu thật)
+  initial_eth: 100.0
+  initial_eth_source: PRE_OWNED # PRE_OWNED | BUY_WITH_CASH
+  cash_multiplier: 2.0 # initial_cash = N * C * cash_multiplier
+
+collateral: # RESEARCH PARAMETER
+  r: 1.00
+  z: 0.0 # legacy compatibility; not used by Basic spec
+  haircut: 0.0 # legacy compatibility; not used by Basic spec
+  maintenance_threshold: 1.00 # legacy compatibility; checks use total collateral
+  insufficient_eth_policy: FILTER # MODEL ASSUMPTION: FILTER | ERROR
+  release_policy: AT_END # Basic spec: collateral stays locked until end
+
+auction: # RESEARCH PARAMETER
+  bid_max: 0.20
+  max_ratio: 1.50
+  increment: 0.10
+  bid_tick: 0.0 # MODEL ASSUMPTION: 0 = bid liên tục; 0.05 = làm tròn (tạo hòa bid cho F12)
+
+behavior: # RESEARCH PARAMETER
+  default_probability: 0.05
+  collusion_probability: 0.00
+  collusion_suspicion_threshold: 0.05 # F15
+
+post_default: # MODEL ASSUMPTION (design spec, configurable)
+  th1_equality_policy: TH1
+  th2_default_decision: TERMINATE_AND_REFUND # CONTINUE_SUB_HUI | TERMINATE_AND_REFUND
+
+margin: # MODEL ASSUMPTION (baseline, không do tài liệu quy định)
+  margin_check_interval_days: 7
+  margin_call_grace_periods: 0
+  margin_topup_policy: AUTO # MODEL ASSUMPTION: AUTO | NONE
+
+crash: # RESEARCH PARAMETER
+  enabled: true
+  threshold: 0.20
+
+simulation:
+  random_seed: 42
+  runs: 100
+
+modes: # dùng cho Phase 10
+  quick: { paths: 10, seeds: 10 }
+  normal: { paths: 50, seeds: 50 }
+  full: { paths: all, seeds: 100 }

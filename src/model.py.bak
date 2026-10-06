@@ -1,0 +1,600 @@
+"""HuiChainModel (Mesa 3.x). Phase 7: F1-F16 + failure logic. Một step = một round."""
+from __future__ import annotations
+
+import random
+
+from mesa import Model
+from mesa.datacollection import DataCollector
+
+from src import mechanisms as mech
+from src.agents import ACTIVE, COMPLETED, DEFAULTED, RECEIVED, MemberAgent
+
+TOL = 1e-6
+DECISIONS = ("CONTINUE_SUB_HUI", "TERMINATE_AND_REFUND")
+
+
+class HuiChainModel(Model):
+    def __init__(self, *, N, contribution_usd, r, bid_max, max_ratio, initial_eth,
+                 initial_eth_source, cash_multiplier, default_probability,
+                 prices, dates, path_id="", seed=42, bid_schedule=None, verbose=False,
+                 z=0.0, sigma_eth=0.0, haircut=0.0, maintenance_threshold=1.15,
+                 insufficient_eth_policy="FILTER", increment=0.10, bid_tick=0.0,
+                 release_policy="PROGRESSIVE",
+                 post_default_decision="TERMINATE_AND_REFUND",
+                 margin_call_grace_periods=0, margin_topup_policy="AUTO",
+                 crash_enabled=True, crash_threshold=0.20,
+                 collusion_probability=0.0, collusion_suspicion_threshold=0.05,
+                 forced_defaults=None):
+        super().__init__()
+        if initial_eth_source != "PRE_OWNED":
+            raise NotImplementedError("Chỉ hỗ trợ initial_eth_source = PRE_OWNED")
+        if insufficient_eth_policy not in ("FILTER", "ERROR"):
+            raise ValueError("insufficient_eth_policy phải là FILTER hoặc ERROR")
+        if release_policy not in ("PROGRESSIVE", "AT_END"):
+            raise ValueError("release_policy phải là PROGRESSIVE hoặc AT_END")
+        if post_default_decision not in DECISIONS:
+            raise ValueError(f"post_default_decision phải thuộc {DECISIONS}")
+        if margin_topup_policy not in ("AUTO", "NONE"):
+            raise ValueError("margin_topup_policy phải là AUTO hoặc NONE")
+        if margin_call_grace_periods < 0:
+            raise ValueError("margin_call_grace_periods phải >= 0")
+        if len(prices) != N or len(dates) != N:
+            raise ValueError(f"path phải có đúng N={N} giá/ngày")
+        if not (0.0 <= haircut < 1.0):
+            raise ValueError("haircut phải trong [0, 1)")
+
+        self.N, self.C, self.r = N, float(contribution_usd), r
+        self.bid_max, self.max_ratio, self.increment = bid_max, max_ratio, increment
+        self.bid_tick, self.release_policy = bid_tick, release_policy
+        self.z, self.sigma_eth = z, sigma_eth
+        self.haircut, self.maintenance_threshold = haircut, maintenance_threshold
+        self.insufficient_eth_policy = insufficient_eth_policy
+        self.post_default_decision = post_default_decision
+        self.grace = int(margin_call_grace_periods)
+        self.margin_topup_policy = margin_topup_policy
+        self.crash_enabled, self.crash_threshold = crash_enabled, crash_threshold
+        self.collusion_suspicion_threshold = collusion_suspicion_threshold
+        self.forced_defaults = {int(k): list(v) for k, v in (forced_defaults or {}).items()}
+        self.prices, self.dates, self.path_id = list(prices), list(dates), path_id
+        self.seed, self.bid_schedule, self.verbose = seed, bid_schedule, verbose
+        self.py_rng = random.Random(seed)                         # bid + risk_tolerance
+        self.beh_rng = random.Random(f"{seed}-behavior")          # default ngẫu nhiên
+        col_rng = random.Random(f"{seed}-collusion")              # nhóm collusion
+
+        initial_cash = N * self.C * cash_multiplier               # MODEL ASSUMPTION
+        self.members = [
+            MemberAgent(self, j, initial_cash, initial_eth,
+                        self.py_rng.uniform(1.0, max_ratio), default_probability)
+            for j in range(1, N + 1)
+        ]
+        for a in self.members:                                    # luôn rút N số
+            if col_rng.random() < collusion_probability:
+                a.collusion_group = "G1"
+        if sum(1 for a in self.members if a.collusion_group) < 2:
+            for a in self.members:
+                a.collusion_group = None
+
+        self.total_initial_cash = initial_cash * N
+        self.system_fund_usd = 0.0
+        self.liquidation_proceeds_usd = 0.0
+
+        self.end_round = N
+        self.current_round = 0
+        self.current_eth_usd = None
+        self.current_date = None
+        self.hui_status = "RUNNING"
+        self.hui_broken = False
+        self.sub_hui_created = False
+        self.default_branch = None
+        self.failure_type = None
+        self.broken_round = None
+        self.first_failure_round = None
+        self.failure_events = []
+        self.round_failures = {}
+        self.cascade_count = 0
+        self.max_drawdown = 0.0
+        self.crash_count = 0
+        self.collusion_result = None
+        self._mkt = {}
+        self.round_log = []
+        self.running = True
+
+        self.datacollector = DataCollector(
+            model_reporters={
+                "round": lambda m: m.current_round,
+                "eth_usd": lambda m: m.current_eth_usd,
+                "hui_status": lambda m: m.hui_status,
+            },
+            agent_reporters={
+                "status": "status",
+                "cash_usd": "cash_balance_usd",
+                "locked_eth": "locked_eth",
+                "future_obligation_usd": "future_obligation_usd",
+            },
+        )
+        self.datacollector.collect(self)
+
+    # ------------------------------------------------------------------
+    def step(self):
+        if not self.running:
+            return
+        t = self.current_round + 1
+        self.current_round = t
+        C = self.C
+        price = self.prices[t - 1]
+        self.current_eth_usd = price
+        self.current_date = self.dates[t - 1]
+        self._set_market_fields(t, price)
+        n0 = len(self.failure_events)
+
+        # A) Behavioral default (đầu round, trước contribution)
+        for a, reason in self._collect_defaulters(t):
+            if not self.running:
+                break
+            if a.status == DEFAULTED:
+                continue
+            missed = (self.end_round - t + 1) * C
+            self._resolve_failure(a, "BEHAVIORAL", reason, missed, t - 1, price, t)
+        if not self.running:
+            return self._finalize_round(t, self._empty_rec(t, price), n0)
+
+        end = self.end_round
+
+        # B) Yêu cầu collateral ở ratio r (để lọc điều kiện bid)
+        fut = mech.future_obligation(t, end, C)
+        coll = mech.collateral_usd(t, end, C, self.r)
+        base = mech.collateral_eth_base(coll, price)
+        buf = mech.safety_buffer(self.z, self.sigma_eth, end, t)
+        req = mech.collateral_eth_actual(base, buf)
+
+        candidates = [a for a in self.members if a.eligible_to_bid]
+        eligible = [a for a in candidates if a.available_eth + TOL >= req]
+        short = [a.join_order for a in candidates if a not in eligible]
+        if short and self.insufficient_eth_policy == "ERROR":
+            raise RuntimeError(f"round {t}: member {short} thiếu ETH (cần {req:.4f})")
+        if not eligible:
+            self.hui_status = "BROKEN"
+            self.hui_broken = True
+            self.failure_type = "NO_ELIGIBLE_BIDDER_INSUFFICIENT_ETH"
+            self.broken_round = t
+            self.running = False
+            rec = self._empty_rec(t, price, insufficient_eth_members=short, collateral_usd=coll,
+                                  collateral_eth_base=base, buffer=buf, collateral_eth_actual=req)
+            return self._finalize_round(t, rec, n0)
+
+        # C) Contribution: mọi member ACTIVE/RECEIVED đóng C
+        payers = [a for a in self.members if a.status in (ACTIVE, RECEIVED)]
+        for a in payers:
+            a.pay_contribution(C)
+        pot = C * len(payers)
+        if abs(pot - mech.total_pot(len(payers), C)) > TOL:
+            raise AssertionError("TOTAL_POT != (số người đóng) * C")
+
+        # D) Auction (round cuối: không bid)
+        is_last = (t == end)
+        if is_last:
+            if len(candidates) != 1:
+                raise AssertionError("round cuối phải còn đúng 1 member chưa nhận")
+            bids = {eligible[0].join_order: 0.0}
+        else:
+            bids = {a.join_order: a.make_bid(t) for a in eligible}
+
+        top = max(bids.values())
+        tied = [a for a in eligible if bids[a.join_order] >= top - 1e-12]
+        ratio, tie_break = self.r, None
+        if len(tied) >= 2 and not is_last:
+            tie_break = mech.collateral_tie_break(
+                [(a.join_order, a.risk_tolerance) for a in tied], self.max_ratio, self.increment)
+            winner = next(a for a in tied if a.join_order == tie_break["winner"])
+            ratio = max(self.r, tie_break["winning_ratio"])
+        else:
+            winner = min(tied, key=lambda a: a.join_order)
+        bid = bids[winner.join_order]
+
+        coll_eff = mech.collateral_usd(t, end, C, ratio)
+        base_eff = mech.collateral_eth_base(coll_eff, price)
+        req_eff = mech.collateral_eth_actual(base_eff, buf)
+        if fut > 0 and req_eff > winner.available_eth:
+            ratio = max(self.r, winner.available_eth * price / (fut * (1.0 + buf)))
+            coll_eff = mech.collateral_usd(t, end, C, ratio)
+            base_eff = mech.collateral_eth_base(coll_eff, price)
+            req_eff = mech.collateral_eth_actual(base_eff, buf)
+
+        # E) F3, F4, F5
+        discount = mech.discount_amount(bid, pot)
+        payout = mech.winner_payout(pot, discount)
+        winner.cash_balance_usd += payout
+        recipients = [a for a in candidates if a is not winner]
+        shares = mech.distribute_discount(discount, [a.join_order for a in recipients])
+        for a in recipients:
+            a.cash_balance_usd += shares[a.join_order]
+
+        # F) Winner -> RECEIVED; F6-F9, F14; lock ETH
+        winner.status = RECEIVED
+        winner.received_hui = True
+        winner.received_round = t
+        winner.bid_rate = bid
+        winner.collateral_ratio = ratio
+        winner.collateral_usd = coll_eff
+        winner.collateral_eth_base = base_eff
+        winner.collateral_buffer = buf
+        winner.lock_price = price
+        winner.liquidity_benefit_usd = mech.liquidity_benefit(payout, C, coll_eff)
+        winner.available_eth = max(0.0, winner.available_eth - req_eff)
+        winner.locked_eth += req_eff
+        for a in self.members:
+            if a.status == RECEIVED:
+                a.future_obligation_usd = fut
+
+        # G) F16: release dần
+        released = {}
+        for a in self.members:
+            if a.status == RECEIVED and a.received_round < t and a.locked_eth > 0:
+                required = mech.required_eth_safe(a.collateral_ratio, fut, price, buf)
+                amt = mech.release_amount(a.locked_eth, required)
+                if self.release_policy == "AT_END" and not is_last:
+                    amt = 0.0
+                if amt > 0:
+                    a.locked_eth -= amt
+                    a.available_eth += amt
+                    a.collateral_released_eth += amt
+                    released[a.join_order] = amt
+
+        # H) F11 + margin call (grace) + top-up / price-driven failure
+        margin_ratios, margin_calls, topups, due = {}, [], {}, []
+        for a in self.members:
+            if a.status == RECEIVED and a.locked_eth > 0:
+                mr = mech.margin_ratio(a.locked_eth, price, fut)
+                a.margin_ratio = mr
+                margin_ratios[a.join_order] = mr
+                if mech.is_margin_call(mr, self.maintenance_threshold):
+                    a.margin_call_count += 1
+                    a.margin_call_streak += 1
+                    margin_calls.append(a.join_order)
+                    if a.margin_call_streak > self.grace:
+                        due.append(a)
+                else:
+                    a.margin_call_streak = 0
+        for a in due:
+            if not self.running:
+                break
+            moved = self._handle_margin_call(a, t, price)
+            if moved is not None:
+                topups[a.join_order] = moved
+
+        # I) Kết thúc ở round cuối (nếu chưa bị kết thúc bởi failure)
+        if is_last and self.running:
+            for a in self.members:
+                if a.status == RECEIVED:
+                    a.status = COMPLETED
+            self.hui_status = "COMPLETED"
+            self.running = False
+
+        rec = {
+            "round": t, "date": self.current_date, "eth_usd": price, "is_last": is_last,
+            "eligible_bidders": [a.join_order for a in eligible], "bids": bids,
+            "insufficient_eth_members": short, "tie_break": tie_break,
+            "winner": winner.join_order, "bid_rate": bid, "pot": pot,
+            "discount": discount, "payout": payout, "discount_shares": shares,
+            "future_obligation_usd": fut, "collateral_ratio": ratio,
+            "collateral_usd": coll_eff, "collateral_eth_base": base_eff, "buffer": buf,
+            "collateral_eth_actual": req_eff,
+            "liquidity_benefit_usd": winner.liquidity_benefit_usd,
+            "margin_ratios": margin_ratios, "margin_calls": margin_calls, "topups": topups,
+            "released": released, "released_total_eth": sum(released.values()),
+            "locked_eth_total": sum(a.locked_eth for a in self.members),
+            **self._mkt,
+        }
+        self._finalize_round(t, rec, n0)
+
+    def run(self):
+        while self.running:
+            self.step()
+        grp = sorted(a.join_order for a in self.members if a.collusion_group)
+        if grp:
+            self.collusion_result = self.collusion_check(grp, self.collusion_suspicion_threshold)
+        return self
+
+    # ------------------------------------------------------------------
+    # Market / crash
+    def _set_market_fields(self, t, price):
+        ret = None if t == 1 else price / self.prices[t - 2] - 1.0
+        dd = 1.0 - price / max(self.prices[:t])
+        self.max_drawdown = max(self.max_drawdown, dd)
+        crash = bool(self.crash_enabled and ret is not None and ret <= -self.crash_threshold)
+        if crash:
+            self.crash_count += 1
+        self._mkt = {"eth_return": ret, "drawdown": dd, "crash_flag": crash}
+
+    # ------------------------------------------------------------------
+    # Default detection
+    def _collect_defaulters(self, t):
+        forced = set(self.forced_defaults.get(t, ()))
+        out = []
+        for a in self.members:
+            u = self.beh_rng.random()                 # luôn rút -> reproducible, common random numbers
+            if a.status not in (ACTIVE, RECEIVED):
+                continue
+            if a.cash_balance_usd + 1e-12 < self.C:
+                out.append((a, "INSUFFICIENT_CASH"))
+            elif a.join_order in forced:
+                out.append((a, "FORCED"))
+            elif a.status == RECEIVED and u < a.default_probability:
+                out.append((a, "RANDOM_DEFAULT"))
+        return out
+
+    # ------------------------------------------------------------------
+    # Margin call
+    def _handle_margin_call(self, a, t, price):
+        """Trả về ETH đã nạp thêm, hoặc None nếu dẫn tới price-driven failure."""
+        fut = (self.end_round - t) * self.C
+        buf = mech.safety_buffer(self.z, self.sigma_eth, self.end_round, t)
+        target = max(mech.required_eth_safe(a.collateral_ratio, fut, price, buf),
+                     self.maintenance_threshold * fut / price * (1.0 + 1e-9))
+        need = max(0.0, target - a.locked_eth)
+        if self.margin_topup_policy == "AUTO" and a.available_eth + TOL >= need:
+            moved = min(need, a.available_eth)
+            a.available_eth -= moved
+            a.locked_eth += moved
+            a.collateral_topup_eth += moved
+            a.margin_call_streak = 0
+            a.margin_ratio = mech.margin_ratio(a.locked_eth, price, fut)
+            return moved
+        self._resolve_failure(a, "PRICE_DRIVEN", "MARGIN_CALL_UNRESOLVED", fut, t, price, t)
+        return None
+
+    # ------------------------------------------------------------------
+    # Failure (behavioral default hoặc price-driven) + TH1/TH2
+    def _resolve_failure(self, a, kind, reason, missed, completed_rounds, price, t):
+        eth_sold = a.locked_eth
+        liq = mech.liquidation_value_usd(eth_sold, price, self.haircut)     # F10, giá lúc thanh lý
+        a.locked_eth = 0.0
+        a.total_eth -= eth_sold
+        a.collateral_liquidated_eth += eth_sold
+        self.liquidation_proceeds_usd += liq
+        self.system_fund_usd += liq
+
+        recovery, residual = mech.recovery_and_residual(missed, liq)        # F13
+        branch, surplus = mech.classify_post_default(liq, missed)
+        system_loss = residual if branch == "TH1" else 0.0
+
+        if kind == "BEHAVIORAL":
+            a.behavioral_default_count += 1
+            ftype = ("BEHAVIORAL_DEFAULT_INSUFFICIENT_COLLATERAL" if branch == "TH1"
+                     else "BEHAVIORAL_DEFAULT_SURPLUS_COLLATERAL")
+        else:
+            a.price_driven_failure_count += 1
+            ftype = "PRICE_DRIVEN"
+        a.status = DEFAULTED
+        a.defaulted_round = t
+        a.default_reason = reason
+        a.failure_type = ftype
+        a.future_obligation_usd = 0.0
+        a.recovery_usd += recovery
+        a.residual_loss_usd += residual
+
+        remaining = [x for x in self.members if x.status in (ACTIVE, RECEIVED)]
+        ev = {
+            "round": t, "member": a.join_order, "kind": kind, "reason": reason,
+            "price": price, "eth_liquidated": eth_sold, "branch": branch,
+            "obligation_missed_usd": missed, "liquidation_value_usd": liq,
+            "recovery_usd": recovery, "residual_loss_usd": residual,
+            "system_loss_usd": system_loss, "surplus_liquidation_usd": surplus,
+            "post_default_decision": None, "refund_pool_usd": 0.0, "total_refund_usd": 0.0,
+            "system_surplus_usd": 0.0, "surplus_per_member": 0.0, "refunds": {},
+            "num_remaining_members": len(remaining), "sub_hui_created": False,
+            "hui_broken": False, "failure_type": ftype, "released_after": {},
+        }
+        if self.first_failure_round is None:
+            self.first_failure_round = t
+        self.default_branch = branch
+
+        if branch == "TH1":
+            # Không tạo sub-hui; hụi vỡ; ghi system_loss. recovery nằm lại system_fund.
+            self.hui_broken = True
+            ev["hui_broken"] = True
+            self._end_hui("BROKEN", t, ftype, ev)
+        else:
+            decision = self.post_default_decision
+            ev["post_default_decision"] = decision
+            if decision == "CONTINUE_SUB_HUI" and remaining:
+                per = surplus / len(remaining)
+                for x in remaining:
+                    x.cash_balance_usd += per
+                self.system_fund_usd -= surplus
+                ev["surplus_per_member"] = per
+                unreceived = sum(1 for x in remaining if not x.received_hui)
+                self.end_round = completed_rounds + unreceived
+                self.sub_hui_created = True
+                ev["sub_hui_created"] = True
+                if unreceived == 0:                      # không còn ai chờ nhận -> hụi hoàn tất
+                    for x in remaining:
+                        if x.status == RECEIVED:
+                            x.status = COMPLETED
+                    self._end_hui("COMPLETED", None, None, ev)
+                if self.failure_type is None:
+                    self.failure_type = ftype
+            else:                                        # TERMINATE_AND_REFUND (hoặc không còn ai)
+                pool = surplus
+                paid = {x.join_order: x.contribution_paid_usd for x in remaining}
+                refunds, total_refund, sys_surplus = mech.refund_distribution(pool, paid)
+                for x in remaining:
+                    x.cash_balance_usd += refunds.get(x.join_order, 0.0)
+                self.system_fund_usd -= total_refund
+                ev.update(refund_pool_usd=pool, total_refund_usd=total_refund,
+                          system_surplus_usd=sys_surplus, refunds=refunds)
+                self.hui_broken = True
+                ev["hui_broken"] = True
+                self._end_hui("BROKEN", t, ftype, ev)
+
+        self.failure_events.append(ev)
+        if self.verbose:
+            self._print_failure(ev)
+
+    def _end_hui(self, status, broken_round, ftype, ev):
+        self.hui_status = status
+        self.running = False
+        if status == "BROKEN":
+            self.broken_round = broken_round
+            self.failure_type = ftype
+        ev["released_after"] = self._release_all_locked()
+
+    def _release_all_locked(self):
+        out = {}
+        for a in self.members:
+            if a.locked_eth > 0:
+                out[a.join_order] = a.locked_eth
+                a.available_eth += a.locked_eth
+                a.collateral_released_eth += a.locked_eth
+                a.locked_eth = 0.0
+        return out
+
+    # ------------------------------------------------------------------
+    def _empty_rec(self, t, price, **kw):
+        rec = {
+            "round": t, "date": self.current_date, "eth_usd": price, "is_last": False,
+            "eligible_bidders": [], "bids": {}, "insufficient_eth_members": [],
+            "tie_break": None, "winner": None, "bid_rate": 0.0, "pot": 0.0,
+            "discount": 0.0, "payout": 0.0, "discount_shares": {},
+            "future_obligation_usd": None, "collateral_ratio": self.r,
+            "collateral_usd": 0.0, "collateral_eth_base": 0.0, "buffer": 0.0,
+            "collateral_eth_actual": 0.0, "liquidity_benefit_usd": None,
+            "margin_ratios": {}, "margin_calls": [], "topups": {}, "released": {},
+            "released_total_eth": 0.0,
+            "locked_eth_total": sum(a.locked_eth for a in self.members),
+            **self._mkt,
+        }
+        rec.update(kw)
+        return rec
+
+    def _finalize_round(self, t, rec, n0):
+        evs = self.failure_events[n0:]
+        rec["failures"] = [(e["member"], e["kind"], e["branch"]) for e in evs]
+        rec["hui_status"] = self.hui_status
+        n = len(evs)
+        self.round_failures[t] = n
+        if n:
+            self.cascade_count += (n - 1) + (1 if self.round_failures.get(t - 1, 0) > 0 else 0)
+        self.check_invariants()
+        self.round_log.append(rec)
+        self.datacollector.collect(self)
+        if self.verbose:
+            self._print_round(rec)
+
+    # ------------------------------------------------------------------
+    def collusion_check(self, group, threshold=0.05):
+        """F15 (nghi ngờ thống kê, không phải bằng chứng) cho một nhóm join_order."""
+        group = set(group)
+        n = k = 0
+        probs = []
+        for rec in self.round_log:
+            if rec["winner"] is None or rec.get("is_last"):
+                continue
+            elig = rec["eligible_bidders"]
+            g = len(group & set(elig))
+            if g == 0 or g == len(elig):
+                continue
+            n += 1
+            probs.append(g / len(elig))
+            k += int(rec["winner"] in group)
+        p_bar = sum(probs) / n if n else 0.0
+        out = mech.collusion_suspicion(n, p_bar, k, threshold)
+        out["group"] = sorted(group)
+        return out
+
+    def post_default_summary(self):
+        evs = self.failure_events
+
+        def S(key):
+            return sum(e[key] for e in evs)
+
+        th2 = [e for e in evs if e["branch"] == "TH2"]
+        return {
+            "num_failures": len(evs),
+            "num_behavioral_defaults": sum(e["kind"] == "BEHAVIORAL" for e in evs),
+            "num_price_driven_failures": sum(e["kind"] == "PRICE_DRIVEN" for e in evs),
+            "default_branch": ("TH1" if any(e["branch"] == "TH1" for e in evs)
+                               else ("TH2" if evs else None)),
+            "obligation_missed_usd": S("obligation_missed_usd"),
+            "liquidation_value_usd": S("liquidation_value_usd"),
+            "recovery_usd": S("recovery_usd"),
+            "residual_loss_usd": S("residual_loss_usd"),
+            "system_loss_usd": S("system_loss_usd"),
+            "surplus_liquidation_usd": S("surplus_liquidation_usd"),
+            "post_default_decision": th2[-1]["post_default_decision"] if th2 else None,
+            "refund_pool_usd": S("refund_pool_usd"),
+            "total_refund_usd": S("total_refund_usd"),
+            "system_surplus_usd": S("system_surplus_usd"),
+            "num_remaining_members": evs[-1]["num_remaining_members"] if evs else None,
+            "sub_hui_created": self.sub_hui_created,
+            "hui_broken": self.hui_broken,
+            "broken_round": self.broken_round,
+            "first_failure_round": self.first_failure_round,
+            "cascade_count": self.cascade_count,
+        }
+
+    def check_invariants(self):
+        for a in self.members:
+            if a.cash_balance_usd < -TOL:
+                raise AssertionError(f"cash âm: member {a.join_order}")
+            if a.available_eth < -TOL or a.locked_eth < -TOL:
+                raise AssertionError(f"ETH âm: member {a.join_order}")
+            if abs(a.available_eth + a.locked_eth - a.total_eth) > TOL:
+                raise AssertionError(f"ETH không bảo toàn: member {a.join_order}")
+        if self.system_fund_usd < -TOL:
+            raise AssertionError("system_fund âm")
+        total = sum(a.cash_balance_usd for a in self.members) + self.system_fund_usd
+        expected = self.total_initial_cash + self.liquidation_proceeds_usd
+        if abs(total - expected) > TOL:
+            raise AssertionError(f"tiền bị tạo/mất: {total} != {expected}")
+
+    # ------------------------------------------------------------------
+    def _print_failure(self, e):
+        print(f"\n--- FAILURE round {e['round']} | member {e['member']} | {e['kind']} ({e['reason']}) ---")
+        print(f"ETH price (liquidation): {e['price']:.2f} | ETH liquidated {e['eth_liquidated']:.4f}")
+        print(f"obligation missed      : {e['obligation_missed_usd']:.2f}")
+        print(f"liquidation value (F10): {e['liquidation_value_usd']:.2f}")
+        print(f"recovery / residual    : {e['recovery_usd']:.2f} / {e['residual_loss_usd']:.2f}")
+        print(f"post-default branch    : {e['branch']} | surplus {e['surplus_liquidation_usd']:.2f} "
+              f"| system loss {e['system_loss_usd']:.2f}")
+        print(f"post-default decision  : {e['post_default_decision']}")
+        print(f"refund pool / refunded : {e['refund_pool_usd']:.2f} / {e['total_refund_usd']:.2f} "
+              f"| system surplus {e['system_surplus_usd']:.2f}")
+        print(f"remaining members      : {e['num_remaining_members']} | surplus/member {e['surplus_per_member']:.2f}")
+        print(f"sub-hui created        : {e['sub_hui_created']} | hui broken: {e['hui_broken']}")
+
+    def _print_round(self, rec):
+        ret = rec["eth_return"]
+        ret_s = "-" if ret is None else f"{ret:+.2%}"
+        print(f"\n=== ROUND {rec['round']}/{self.end_round} | {rec['date']} | ETH/USD {rec['eth_usd']:.2f} "
+              f"| return {ret_s} | drawdown {rec['drawdown']:.2%} | crash {rec['crash_flag']} ===")
+        if rec["winner"] is None:
+            print(f"không có auction (không ai đủ ETH hoặc hụi đã dừng). status: {rec['hui_status']}")
+            return
+        bids = {k: round(v, 4) for k, v in rec["bids"].items()}
+        shares = {k: round(v, 2) for k, v in rec["discount_shares"].items()}
+        mr = {k: round(v, 3) for k, v in rec["margin_ratios"].items()}
+        rel = {k: round(v, 4) for k, v in rec["released"].items()}
+        print(f"eligible bidders      : {rec['eligible_bidders']} (thiếu ETH: {rec['insufficient_eth_members']})")
+        print(f"bids                  : {bids}")
+        tb = rec["tie_break"]
+        if tb:
+            print(f"F12 tie-break         : willing_max {tb['willing_max']} -> winner {tb['winner']}, "
+                  f"winning_ratio {tb['winning_ratio']:.3f}")
+        print(f"winner (join_order)   : {rec['winner']}  | winning bid {rec['bid_rate']:.4f}")
+        print(f"total pot             : {rec['pot']:.2f}")
+        print(f"discount / payout     : {rec['discount']:.2f} / {rec['payout']:.2f}")
+        print(f"discount shares       : {shares}")
+        print(f"future obligation USD : {rec['future_obligation_usd']:.2f}")
+        print(f"collateral ratio      : {rec['collateral_ratio']:.3f} (r = {self.r})")
+        print(f"collateral USD (F7)   : {rec['collateral_usd']:.2f}")
+        print(f"base ETH (F8)         : {rec['collateral_eth_base']:.4f}")
+        print(f"buffer (F9)           : {rec['buffer']:.4f}")
+        print(f"actual ETH locked     : {rec['collateral_eth_actual']:.4f}")
+        print(f"liquidity benefit F14 : {rec['liquidity_benefit_usd']:.2f}")
+        print(f"release F16           : {rel} | total {rec['released_total_eth']:.4f} "
+              f"| locked sau round {rec['locked_eth_total']:.4f}")
+        print(f"margin ratio (F11)    : {mr} | threshold {self.maintenance_threshold}")
+        print(f"margin call / top-up  : {rec['margin_calls']} / {({k: round(v, 4) for k, v in rec['topups'].items()})}")
+        print(f"failures              : {rec['failures']}")
+        print(f"hui status            : {rec['hui_status']}")
